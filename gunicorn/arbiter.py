@@ -13,13 +13,13 @@ import sys
 import time
 import traceback
 
-
 from gunicorn.errors import HaltServer
 from gunicorn.pidfile import Pidfile
-from gunicorn.sock import create_socket
+from gunicorn.sock import create_sockets
 from gunicorn import util
 
 from gunicorn import __version__, SERVER_SOFTWARE
+
 
 class Arbiter(object):
     """
@@ -35,16 +35,14 @@ class Arbiter(object):
 
     START_CTX = {}
 
-    LISTENER = None
+    LISTENERS = []
     WORKERS = {}
     PIPE = []
 
     # I love dynamic languages
     SIG_QUEUE = []
-    SIGNALS = map(
-        lambda x: getattr(signal, "SIG%s" % x),
-        "HUP QUIT INT TERM TTIN TTOU USR1 USR2 WINCH".split()
-    )
+    SIGNALS = [getattr(signal, "SIG%s" % x) \
+            for x in "HUP QUIT INT TERM TTIN TTOU USR1 USR2 WINCH".split()]
     SIG_NAMES = dict(
         (getattr(signal, name), name[3:].lower()) for name in dir(signal)
         if name[:3] == "SIG" and name[3] != "_"
@@ -53,6 +51,7 @@ class Arbiter(object):
     def __init__(self, app):
         os.environ["SERVER_SOFTWARE"] = SERVER_SOFTWARE
 
+        self._num_workers = None
         self.setup(app)
 
         self.pidfile = None
@@ -60,16 +59,7 @@ class Arbiter(object):
         self.reexec_pid = 0
         self.master_name = "Master"
 
-        # get current path, try to use PWD env first
-        try:
-            a = os.stat(os.environ['PWD'])
-            b = os.stat(os.getcwd())
-            if a.ino == b.ino and a.dev == b.dev:
-                cwd = os.environ['PWD']
-            else:
-                cwd = os.getcwd()
-        except:
-            cwd = os.getcwd()
+        cwd = util.getcwd()
 
         args = sys.argv[:]
         args.insert(0, sys.executable)
@@ -80,6 +70,15 @@ class Arbiter(object):
             "cwd": cwd,
             0: sys.executable
         }
+
+    def _get_num_workers(self):
+        return self._num_workers
+
+    def _set_num_workers(self, value):
+        old_value = self._num_workers
+        self._num_workers = value
+        self.cfg.nworkers_changed(self, value, old_value)
+    num_workers = property(_get_num_workers, _set_num_workers)
 
     def setup(self, app):
         self.app = app
@@ -99,7 +98,8 @@ class Arbiter(object):
 
         if self.cfg.debug:
             self.log.debug("Current configuration:")
-            for config, value in sorted(self.cfg.settings.iteritems()):
+            for config, value in sorted(self.cfg.settings.items(),
+                    key=lambda setting: setting[1]):
                 self.log.debug("  %s: %s", config, value.value)
 
         if self.cfg.preload_app:
@@ -113,18 +113,18 @@ class Arbiter(object):
         Initialize the arbiter. Start listening and set pidfile if needed.
         """
         self.log.info("Starting gunicorn %s", __version__)
-        self.cfg.on_starting(self)
         self.pid = os.getpid()
-        self.init_signals()
-        if not self.LISTENER:
-            self.LISTENER = create_socket(self.cfg, self.log)
-
         if self.cfg.pidfile is not None:
             self.pidfile = Pidfile(self.cfg.pidfile)
             self.pidfile.create(self.pid)
+        self.cfg.on_starting(self)
+        self.init_signals()
+        if not self.LISTENERS:
+            self.LISTENERS = create_sockets(self.cfg, self.log)
+
+        listeners_str = ",".join([str(l) for l in self.LISTENERS])
         self.log.debug("Arbiter booted")
-        self.log.info("Listening at: %s (%s)", self.LISTENER,
-            self.pid)
+        self.log.info("Listening at: %s (%s)", listeners_str, self.pid)
         self.log.info("Using worker: %s",
                 self.cfg.settings['worker_class'].get())
 
@@ -135,13 +135,20 @@ class Arbiter(object):
         Initialize master signal handling. Most of the signals
         are queued. Child signals only wake up the master.
         """
+        # close old PIPE
         if self.PIPE:
-            map(os.close, self.PIPE)
+            [os.close(p) for p in self.PIPE]
+
+        # initialize the pipe
         self.PIPE = pair = os.pipe()
-        map(util.set_non_blocking, pair)
-        map(util.close_on_exec, pair)
+        for p in pair:
+            util.set_non_blocking(p)
+            util.close_on_exec(p)
+
         self.log.close_on_exec()
-        map(lambda s: signal.signal(s, self.signal), self.SIGNALS)
+
+        # initialize all signals
+        [signal.signal(s, self.signal) for s in self.SIGNALS]
         signal.signal(signal.SIGCHLD, self.handle_chld)
 
     def signal(self, sig, frame):
@@ -181,7 +188,7 @@ class Arbiter(object):
                 self.halt()
             except KeyboardInterrupt:
                 self.halt()
-            except HaltServer, inst:
+            except HaltServer as inst:
                 self.halt(reason=inst.reason, exit_status=inst.exit_status)
             except SystemExit:
                 raise
@@ -270,8 +277,8 @@ class Arbiter(object):
         Wake up the arbiter by writing to the PIPE
         """
         try:
-            os.write(self.PIPE[1], '.')
-        except IOError, e:
+            os.write(self.PIPE[1], b'.')
+        except IOError as e:
             if e.errno not in [errno.EAGAIN, errno.EINTR]:
                 raise
 
@@ -296,15 +303,14 @@ class Arbiter(object):
                 return
             while os.read(self.PIPE[0], 1):
                 pass
-        except select.error, e:
-            if e[0] not in [errno.EAGAIN, errno.EINTR]:
+        except select.error as e:
+            if e.args[0] not in [errno.EAGAIN, errno.EINTR]:
                 raise
-        except OSError, e:
+        except OSError as e:
             if e.errno not in [errno.EAGAIN, errno.EINTR]:
                 raise
         except KeyboardInterrupt:
             sys.exit()
-
 
     def stop(self, graceful=True):
         """\
@@ -313,11 +319,13 @@ class Arbiter(object):
         :attr graceful: boolean, If True (the default) workers will be
         killed gracefully  (ie. trying to wait for the current connection)
         """
-        try:
-            self.LISTENER.close()
-        except Exception:
-            pass
-        self.LISTENER = None
+        for l in self.LISTENERS:
+            try:
+                l.close()
+            except Exception:
+                pass
+
+        self.LISTENERS = []
         sig = signal.SIGQUIT
         if not graceful:
             sig = signal.SIGTERM
@@ -340,11 +348,16 @@ class Arbiter(object):
             self.master_name = "Old Master"
             return
 
-        os.environ['GUNICORN_FD'] = str(self.LISTENER.fileno())
+        fds = [l.fileno() for l in self.LISTENERS]
+        os.environ['GUNICORN_FD'] = ",".join([str(fd) for fd in fds])
+
         os.chdir(self.START_CTX['cwd'])
         self.cfg.pre_exec(self)
-        util.closerange(3, self.LISTENER.fileno())
-        util.closerange(self.LISTENER.fileno()+1, util.get_maxfd())
+
+        # close all file descriptors except bound sockets
+        util.closerange(3, fds[0])
+        util.closerange(fds[-1] + 1, util.get_maxfd())
+
         os.execvpe(self.START_CTX[0], self.START_CTX['args'], os.environ)
 
     def reload(self):
@@ -359,9 +372,11 @@ class Arbiter(object):
 
         # do we need to change listener ?
         if old_address != self.cfg.address:
-            self.LISTENER.close()
-            self.LISTENER = create_socket(self.cfg, self.log)
-            self.log.info("Listening at: %s", self.LISTENER)
+            # close all listeners
+            [l.close for l in self.LISTENERS]
+            # init new listeners
+            self.LISTENERS = create_sockets(self.cfg, self.log)
+            self.log.info("Listening at: %s", ",".join(str(self.LISTENERS)))
 
         # do some actions on reload
         self.cfg.on_reload(self)
@@ -389,6 +404,8 @@ class Arbiter(object):
         """\
         Kill unused/idle workers
         """
+        if not self.timeout:
+            return
         for (pid, worker) in self.WORKERS.items():
             try:
                 if time.time() - worker.tmp.last_update() <= self.timeout:
@@ -421,7 +438,7 @@ class Arbiter(object):
                     if not worker:
                         continue
                     worker.tmp.close()
-        except OSError, e:
+        except OSError as e:
             if e.errno == errno.ECHILD:
                 pass
 
@@ -434,15 +451,15 @@ class Arbiter(object):
             self.spawn_workers()
 
         workers = self.WORKERS.items()
-        workers.sort(key=lambda w: w[1].age)
+        workers = sorted(workers, key=lambda w: w[1].age)
         while len(workers) > self.num_workers:
             (pid, _) = workers.pop(0)
             self.kill_worker(pid, signal.SIGQUIT)
 
     def spawn_worker(self):
         self.worker_age += 1
-        worker = self.worker_class(self.worker_age, self.pid, self.LISTENER,
-                                    self.app, self.timeout/2.0,
+        worker = self.worker_class(self.worker_age, self.pid, self.LISTENERS,
+                                    self.app, self.timeout / 2.0,
                                     self.cfg, self.log)
         self.cfg.pre_fork(self, worker)
         pid = os.fork()
@@ -461,7 +478,7 @@ class Arbiter(object):
         except SystemExit:
             raise
         except:
-            self.log.debug("Exception in worker process:\n%s",
+            self.log.exception("Exception in worker process:\n%s",
                     traceback.format_exc())
             if not worker.booted:
                 sys.exit(self.WORKER_BOOT_ERROR)
@@ -502,7 +519,7 @@ class Arbiter(object):
          """
         try:
             os.kill(pid, sig)
-        except OSError, e:
+        except OSError as e:
             if e.errno == errno.ESRCH:
                 try:
                     worker = self.WORKERS.pop(pid)

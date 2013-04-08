@@ -6,6 +6,7 @@
 from gunicorn.http.message import Request
 from gunicorn.http.unreader import SocketUnreader, IterUnreader
 
+
 class Parser(object):
     def __init__(self, mesg_class, cfg, source):
         self.mesg_class = mesg_class
@@ -16,10 +17,13 @@ class Parser(object):
             self.unreader = IterUnreader(source)
         self.mesg = None
 
+        # request counter (for keepalive connetions)
+        self.req_count = 0
+
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         # Stop if HTTP dictates a stop.
         if self.mesg and self.mesg.should_close():
             raise StopIteration()
@@ -31,12 +35,15 @@ class Parser(object):
                 data = self.mesg.body.read(8192)
 
         # Parse the next request
-        self.mesg = self.mesg_class(self.cfg, self.unreader)
+        self.req_count += 1
+        self.mesg = self.mesg_class(self.cfg, self.unreader, self.req_count)
         if not self.mesg:
             raise StopIteration()
         return self.mesg
 
+    next = __next__
+
+
 class RequestParser(Parser):
     def __init__(self, *args, **kwargs):
         super(RequestParser, self).__init__(Request, *args, **kwargs)
-

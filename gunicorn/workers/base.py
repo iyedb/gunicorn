@@ -15,18 +15,19 @@ from gunicorn.workers.workertmp import WorkerTmp
 from gunicorn.http.errors import InvalidHeader, InvalidHeaderName, \
 InvalidRequestLine, InvalidRequestMethod, InvalidHTTPVersion, \
 LimitRequestLine, LimitRequestHeaders
+from gunicorn.http.errors import InvalidProxyLine, ForbiddenProxyRequest
 from gunicorn.http.wsgi import default_environ, Response
+from gunicorn.six import MAXSIZE
+
 
 class Worker(object):
 
-    SIGNALS = map(
-        lambda x: getattr(signal, "SIG%s" % x),
-        "HUP QUIT INT TERM USR1 USR2 WINCH CHLD".split()
-    )
+    SIGNALS = [getattr(signal, "SIG%s" % x) \
+            for x in "HUP QUIT INT TERM USR1 USR2 WINCH CHLD".split()]
 
     PIPE = []
 
-    def __init__(self, age, ppid, socket, app, timeout, cfg, log):
+    def __init__(self, age, ppid, sockets, app, timeout, cfg, log):
         """\
         This is called pre-fork so it shouldn't do anything to the
         current process. If there's a need to make process wide
@@ -34,18 +35,17 @@ class Worker(object):
         """
         self.age = age
         self.ppid = ppid
-        self.socket = socket
+        self.sockets = sockets
         self.app = app
         self.timeout = timeout
         self.cfg = cfg
         self.booted = False
 
         self.nr = 0
-        self.max_requests = cfg.max_requests or sys.maxint
+        self.max_requests = cfg.max_requests or MAXSIZE
         self.alive = True
         self.log = log
         self.debug = cfg.debug
-        self.address = self.socket.getsockname()
         self.tmp = WorkerTmp(cfg)
 
     def __str__(self):
@@ -85,11 +85,12 @@ class Worker(object):
 
         # For waking ourselves up
         self.PIPE = os.pipe()
-        map(util.set_non_blocking, self.PIPE)
-        map(util.close_on_exec, self.PIPE)
+        for p in self.PIPE:
+            util.set_non_blocking(p)
+            util.close_on_exec(p)
 
         # Prevent fd inherientence
-        util.close_on_exec(self.socket)
+        [util.close_on_exec(s) for s in self.sockets]
         util.close_on_exec(self.tmp.fileno())
 
         self.log.close_on_exec()
@@ -103,7 +104,9 @@ class Worker(object):
         self.run()
 
     def init_signals(self):
-        map(lambda s: signal.signal(s, signal.SIG_DFL), self.SIGNALS)
+        # reset signaling
+        [signal.signal(s, signal.SIG_DFL) for s in self.SIGNALS]
+        # init new signaling
         signal.signal(signal.SIGQUIT, self.handle_quit)
         signal.signal(signal.SIGTERM, self.handle_exit)
         signal.signal(signal.SIGINT, self.handle_exit)
@@ -127,10 +130,11 @@ class Worker(object):
 
     def handle_error(self, req, client, addr, exc):
         request_start = datetime.now()
-        addr = addr or ('', -1) # unix socket case
+        addr = addr or ('', -1)  # unix socket case
         if isinstance(exc, (InvalidRequestLine, InvalidRequestMethod,
             InvalidHTTPVersion, InvalidHeader, InvalidHeaderName,
-            LimitRequestLine, LimitRequestHeaders,)):
+            LimitRequestLine, LimitRequestHeaders,
+            InvalidProxyLine, ForbiddenProxyRequest,)):
 
             status_int = 400
             reason = "Bad Request"
@@ -142,11 +146,19 @@ class Worker(object):
             elif isinstance(exc, InvalidHTTPVersion):
                 mesg = "<p>Invalid HTTP Version '%s'</p>" % str(exc)
             elif isinstance(exc, (InvalidHeaderName, InvalidHeader,)):
-                mesg = "<p>Invalid Header '%s'</p>" % str(exc)
+                mesg = "<p>%s</p>" % str(exc)
+                if not req and hasattr(exc, "req"):
+                    req = exc.req  # for access log
             elif isinstance(exc, LimitRequestLine):
                 mesg = "<p>%s</p>" % str(exc)
             elif isinstance(exc, LimitRequestHeaders):
                 mesg = "<p>Error parsing headers: '%s'</p>" % str(exc)
+            elif isinstance(exc, InvalidProxyLine):
+                mesg = "<p>'%s'</p>" % str(exc)
+            elif isinstance(exc, ForbiddenProxyRequest):
+                reason = "Forbidden"
+                mesg = "<p>Request forbidden</p>"
+                status_int = 403
 
             self.log.debug("Invalid request from ip={ip}: {error}"\
                            "".format(ip=addr[0],
